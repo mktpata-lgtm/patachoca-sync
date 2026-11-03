@@ -1,12 +1,12 @@
 name: Sincronizar fotos
 on:
-  schedule: [{ cron: "17 * * * *" }]
+  schedule: [{ cron: "17 * * * *" }]   # una vez por hora; baja solo fotos nuevas o cambiadas
   workflow_dispatch: {}
 concurrency: { group: fotos, cancel-in-progress: false }
 jobs:
   fotos:
     runs-on: ubuntu-latest
-    timeout-minutes: 40
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
@@ -19,3 +19,4 @@ jobs:
           GOOGLE_API_KEY: ${{ secrets.GOOGLE_API_KEY }}
           DRIVE_FOLDER_ID: ${{ secrets.DRIVE_FOLDER_ID }}
           MAX_NUEVAS: "1500"
+          TIEMPO_MAX_MIN: "30"
