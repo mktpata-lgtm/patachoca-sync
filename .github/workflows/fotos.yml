@@ -1,0 +1,21 @@
+name: Sincronizar fotos
+on:
+  schedule: [{ cron: "17 * * * *" }]
+  workflow_dispatch: {}
+concurrency: { group: fotos, cancel-in-progress: false }
+jobs:
+  fotos:
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with: { node-version: 22 }
+      - run: npm install --no-save sharp
+      - run: node supabase/sincronizar-fotos.mjs
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SERVICE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}
+          GOOGLE_API_KEY: ${{ secrets.GOOGLE_API_KEY }}
+          DRIVE_FOLDER_ID: ${{ secrets.DRIVE_FOLDER_ID }}
+          MAX_NUEVAS: "1500"
