@@ -1,6 +1,6 @@
 name: Sincronizar fotos
 on:
-  schedule: [{ cron: "7,27,47 * * * *" }]   # cada 20 minutos; si no hay nada nuevo termina en segundos
+  schedule: [{ cron: "*/10 * * * *" }]   # revisa cada 10 min; solo trabaja si toca por la frecuencia del admin o si se forzó
   workflow_dispatch: {}
 concurrency: { group: fotos, cancel-in-progress: false }
 jobs:
@@ -11,7 +11,6 @@ jobs:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
         with: { node-version: 22 }
-      - run: npm install --no-save sharp
       - run: node supabase/sincronizar-fotos.mjs
         env:
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
