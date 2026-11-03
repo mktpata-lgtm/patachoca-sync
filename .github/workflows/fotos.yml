@@ -1,6 +1,6 @@
 name: Sincronizar fotos
 on:
-  schedule: [{ cron: "17 * * * *" }]   # una vez por hora; baja solo fotos nuevas o cambiadas
+  schedule: [{ cron: "7,27,47 * * * *" }]   # cada 20 minutos; si no hay nada nuevo termina en segundos
   workflow_dispatch: {}
 concurrency: { group: fotos, cancel-in-progress: false }
 jobs:
