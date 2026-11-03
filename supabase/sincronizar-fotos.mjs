@@ -3,8 +3,11 @@
 // Optimizado: prioriza (y por defecto SOLO baja) las fotos de productos publicados, descarga en paralelo,
 // miniatura derivada de la foto ya achicada, subida de ambos tamaños a la vez y filas guardadas por lotes.
 // Variables: SUPABASE_URL, SUPABASE_SERVICE_KEY, GOOGLE_API_KEY, DRIVE_FOLDER_ID
+// Corre cada 10 min desde GitHub Actions, pero SOLO trabaja cuando le toca (frecuencia del panel) o si pediste "Forzar".
 // Opcionales: MAX_NUEVAS (1500), PARALELO (4), TIEMPO_MAX_MIN (30), SOLO_PUBLICADOS ("1"; "0" = todas)
-import sharp from "sharp";
+import { execSync } from "node:child_process";
+// Opciones: --forzar (ignora la frecuencia del admin)
+const FORZAR = process.argv.includes("--forzar");
 
 const URL_ = (process.env.SUPABASE_URL || "").replace(/\/+$/, ""), KEY = process.env.SUPABASE_SERVICE_KEY;
 const GK = process.env.GOOGLE_API_KEY, FOLDER = process.env.DRIVE_FOLDER_ID;
@@ -12,13 +15,15 @@ if (!URL_ || !KEY || !GK || !FOLDER) { console.error("Faltan SUPABASE_URL, SUPAB
 const MAX = +(process.env.MAX_NUEVAS || 1500), PAR = +(process.env.PARALELO || 4);
 const SOLO_PUB = (process.env.SOLO_PUBLICADOS ?? "1") !== "0";
 const LIMITE = Date.now() + (+process.env.TIEMPO_MAX_MIN || 30) * 60000;
-sharp.cache(false); sharp.concurrency(2);
 
 const H = (x = {}) => ({ apikey: KEY, ...(KEY.startsWith("sb_secret_") ? {} : { Authorization: `Bearer ${KEY}` }), ...x });
 const dormir = (ms) => new Promise((r) => setTimeout(r, ms));
 // Misma regla que la página: minúscula, sin espacios, sin extensión, solo [a-z0-9._-]
 const clave = (n) => String(n || "").toLowerCase().replace(/\s+/g, "").replace(/\.[a-z0-9]+$/, "").replace(/[^a-z0-9._-]/g, "_");
-const norm = (n) => String(n || "").toLowerCase().replace(/\s+/g, "");
+const quitarExt = (n) => String(n || "").toLowerCase().replace(/\s+/g, "").replace(/\.(jpe?g|png|webp|gif)$/, "");
+const norm = quitarExt;
+// Productos sin nombre de imagen en el sistema: el nombre habitual es CODIGO_CCOLOR (sin espacios, "|" ni "/")
+const derivado = (cod, color) => quitarExt(String(cod || "").replace(/[|\/\s]/g, "") + "_C" + String(color || "").replace(/\s/g, ""));
 
 async function rest(method, path, body, prefer) {
   const r = await fetch(`${URL_}/rest/v1/${path}`, { method, headers: H({ "Content-Type": "application/json", ...(prefer ? { Prefer: prefer } : {}) }), body: body === undefined ? undefined : JSON.stringify(body) });
@@ -63,12 +68,31 @@ async function bajar(f) {
   throw new Error("descarga " + f.name + " → " + motivo);
 }
 
+// ---- 0) ¿Le toca correr? (frecuencia y "forzar" del panel de administración)
+let corrida = null, enDrive = null;
+const cerrar = async (estado, extra = {}) => { if (corrida) { try { await rest("PATCH", `fotos_corridas?id=eq.${corrida}`, { fin: new Date().toISOString(), estado, ...extra }); } catch (e) { console.error("No se pudo anotar la corrida:", e.message); } } };
+let conPanel = true;
+try {
+  const toca = FORZAR ? true : await rest("POST", "rpc/fotos_debe_correr", {});
+  if (!toca) { console.log("Todavía no toca sincronizar fotos."); process.exit(0); }
+  const inicio = new Date().toISOString();
+  corrida = (await rest("POST", "fotos_corridas", { inicio, estado: "corriendo" }, "return=representation"))[0].id;
+  await rest("PATCH", "fotos_solicitudes?tomado=is.null", { tomado: inicio });
+} catch (e) {
+  if (/→ (404|400)/.test(e.message)) { conPanel = false; console.log("Aviso: falta ejecutar 09_fotos_panel.sql; corro igual, sin bitácora."); } else throw e;
+}
+process.on("uncaughtException", async (e) => { console.error(e); await cerrar("error", { detalle: String(e.message || e).slice(0, 300) }); process.exit(1); });
+let sharp;
+try { sharp = (await import("sharp")).default; } catch { console.log("Instalando sharp…"); execSync("npm install --no-save sharp", { stdio: "inherit" }); sharp = (await import("sharp")).default; }
+sharp.cache(false); sharp.concurrency(2);
+
 // ---- 1) Qué hay en Drive, qué ya está en Supabase y qué productos están publicados
 const archivos = await listarDrive();
 console.log(`Drive: ${archivos.length} imágenes`);
-if (archivos.length < 1) { console.error("La carpeta devolvió 0 imágenes: aborto sin tocar nada."); process.exit(1); }
+enDrive = archivos.length;
+if (archivos.length < 1) { console.error("La carpeta devolvió 0 imágenes: aborto sin tocar nada."); await cerrar("error", { detalle: "La carpeta de Drive devolvió 0 imágenes" }); process.exit(1); }
 const ya = new Map((await paginar("fotos?select=drive_file_id,drive_modificado,ruta_storage&order=id")).map((x) => [x.drive_file_id, x]));
-const publicadas = new Set((await paginar("catalogo_publicado?select=imagen&order=clave")).map((x) => norm(x.imagen)).filter(Boolean));
+const publicadas = new Set((await paginar("catalogo_publicado?select=imagen,cod_fabrica,color&order=clave")).map((x) => (x.imagen ? norm(x.imagen) : derivado(x.cod_fabrica, x.color))).filter(Boolean));
 console.log(`Productos publicados con foto indicada: ${publicadas.size}`);
 
 const cambiado = (f) => { const x = ya.get(f.id); return !x || !x.ruta_storage || new Date(x.drive_modificado).getTime() !== new Date(f.modifiedTime).getTime(); };
@@ -117,4 +141,6 @@ const borrar = [...ya.keys()].filter((id) => !vivos.has(id));
 for (const id of borrar) await rest("DELETE", `fotos?drive_file_id=eq.${encodeURIComponent(id)}`);
 const faltan = Math.max(0, cola.length - ok);
 console.log(`Listo: ${ok} subidas, ${mal} con error, ${borrar.length} quitadas. Faltan ${faltan} de productos publicados${SOLO_PUB ? "" : " y otras"}.`);
-if (mal > Math.max(10, lote.length / 2)) process.exit(1);
+const fallo = mal > Math.max(10, lote.length / 2);
+await cerrar(fallo ? "error" : "ok", { subidas: ok, errores: mal, pendientes: faltan, en_drive: enDrive, detalle: fallo ? "Muchas fotos con error (" + mal + " de " + lote.length + ")" : null });
+if (fallo) process.exit(1);
