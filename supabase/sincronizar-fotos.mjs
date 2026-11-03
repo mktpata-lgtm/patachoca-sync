@@ -96,13 +96,16 @@ async function uno(f) {
   filas.push({ drive_file_id: f.id, nombre_archivo: f.name, ruta_storage: `m/${k}.webp`, drive_modificado: f.modifiedTime });
   if (filas.length >= 25) await volcar();
 }
-const t0 = Date.now();
+const t0 = Date.now(), ventana = []; let frenado = false;
+// Si Google/Supabase frena (menos de 60 fotos/min en las últimas 100, tras 3 min), se corta: la próxima corrida arranca a máxima velocidad
+const lento = () => { if (ventana.length < 100 || Date.now() - t0 < 180000) return false; return Date.now() - ventana[ventana.length - 100] > 100000; };
 await Promise.all(Array.from({ length: PAR }, async () => {
   while (i < lote.length) {
+    if (frenado || lento()) { if (!frenado) console.log("La velocidad bajó de 60 fotos por minuto (límite de Google): corto y sigo en la próxima corrida."); frenado = true; break; }
     if (Date.now() > LIMITE) { console.log("Tiempo máximo alcanzado: corto ordenadamente; sigo en la próxima corrida."); break; }
     if (mal >= 30 && ok === 0) { console.error("30 errores seguidos sin ninguna foto subida: corto para no gastar minutos."); break; }
     const f = lote[i++];
-    try { await uno(f); ok++; } catch (e) { mal++; console.error("✗", f.name, e.message); }
+    try { await uno(f); ok++; ventana.push(Date.now()); } catch (e) { mal++; console.error("✗", f.name, e.message); }
     if ((ok + mal) % 50 === 0) console.log(`  ${ok + mal}/${lote.length} · ${Math.round((ok + mal) / ((Date.now() - t0) / 60000))} por minuto`);
   }
 }));
