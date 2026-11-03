@@ -1,0 +1,17 @@
+{
+  "_nota": "Reglas de publicacion. En el panel admin estos valores seran editables.",
+  "stockMinimoTiendas": 4,
+  "fechaDesde": "2024-01-01",
+  "sinFechas": "publicar",
+  "tiendas": {
+    "PATA 1": { "id": "casa-matriz", "nombre": "Casa Matriz (Centro CDE)" },
+    "PATA KM 7": { "id": "km7", "nombre": "Patachoca Km 7" },
+    "PATA LIMPIO": { "id": "limpio", "nombre": "Patachoca Limpio" },
+    "PATA MULTIPLAZA": { "id": "multiplaza", "nombre": "Shopping Multiplaza" },
+    "PATA SAN LORENZO": { "id": "san-lorenzo", "nombre": "San Lorenzo Shopping" },
+    "PCH KM 4": { "id": "km4", "nombre": "Patachoca Km 4" },
+    "PCH LUQUE": { "id": "luque", "nombre": "Patachoca Luque" }
+  },
+  "gruposExcluidos": ["HERRAMIENTAS", "MATERIALES ELECTRICOS", "ELECTRODOMESTICO"],
+  "subgruposExcluidos": ["MKT", "MKT VARIOS", "MUESTRA", "EXPOSITOR", "HERRAMIENTAS", "PRODUCTO DE LIMPIEZA"]
+}
