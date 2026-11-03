@@ -1,18 +1,35 @@
 // Fotos: copia las imágenes de la carpeta pública de Google Drive a Supabase Storage (bucket "fotos").
-// Solo baja lo nuevo o modificado. Genera 2 tamaños WebP: m/ (900 px) y t/ (360 px).
+// Genera 2 tamaños WebP: m/ (900 px) y t/ (360 px). Solo baja lo nuevo o modificado.
+// Optimizado: prioriza (y por defecto SOLO baja) las fotos de productos publicados, descarga en paralelo,
+// miniatura derivada de la foto ya achicada, subida de ambos tamaños a la vez y filas guardadas por lotes.
 // Variables: SUPABASE_URL, SUPABASE_SERVICE_KEY, GOOGLE_API_KEY, DRIVE_FOLDER_ID
-// Opcionales: MAX_NUEVAS (400 por corrida), PARALELO (4)
+// Opcionales: MAX_NUEVAS (1500), PARALELO (4), TIEMPO_MAX_MIN (30), SOLO_PUBLICADOS ("1"; "0" = todas)
 import sharp from "sharp";
 
 const URL_ = (process.env.SUPABASE_URL || "").replace(/\/+$/, ""), KEY = process.env.SUPABASE_SERVICE_KEY;
 const GK = process.env.GOOGLE_API_KEY, FOLDER = process.env.DRIVE_FOLDER_ID;
 if (!URL_ || !KEY || !GK || !FOLDER) { console.error("Faltan SUPABASE_URL, SUPABASE_SERVICE_KEY, GOOGLE_API_KEY o DRIVE_FOLDER_ID"); process.exit(1); }
-const MAX = +(process.env.MAX_NUEVAS || 400), PAR = +(process.env.PARALELO || 2);
-const H = (x = {}) => ({ apikey: KEY, ...(KEY.startsWith("sb_secret_") ? {} : { Authorization: `Bearer ${KEY}` }), ...x });
+const MAX = +(process.env.MAX_NUEVAS || 1500), PAR = +(process.env.PARALELO || 4);
+const SOLO_PUB = (process.env.SOLO_PUBLICADOS ?? "1") !== "0";
+const LIMITE = Date.now() + (+process.env.TIEMPO_MAX_MIN || 30) * 60000;
+sharp.cache(false); sharp.concurrency(2);
 
+const H = (x = {}) => ({ apikey: KEY, ...(KEY.startsWith("sb_secret_") ? {} : { Authorization: `Bearer ${KEY}` }), ...x });
+const dormir = (ms) => new Promise((r) => setTimeout(r, ms));
 // Misma regla que la página: minúscula, sin espacios, sin extensión, solo [a-z0-9._-]
 const clave = (n) => String(n || "").toLowerCase().replace(/\s+/g, "").replace(/\.[a-z0-9]+$/, "").replace(/[^a-z0-9._-]/g, "_");
+const norm = (n) => String(n || "").toLowerCase().replace(/\s+/g, "");
 
+async function rest(method, path, body, prefer) {
+  const r = await fetch(`${URL_}/rest/v1/${path}`, { method, headers: H({ "Content-Type": "application/json", ...(prefer ? { Prefer: prefer } : {}) }), body: body === undefined ? undefined : JSON.stringify(body) });
+  const t = await r.text(); if (!r.ok) throw new Error(`${method} ${path.split("?")[0]} → ${r.status} ${t.slice(0, 200)}`);
+  return t ? JSON.parse(t) : null;
+}
+async function paginar(path) {
+  const out = [];
+  for (let off = 0; ; off += 1000) { const f = await rest("GET", `${path}${path.includes("?") ? "&" : "?"}limit=1000&offset=${off}`); out.push(...f); if (f.length < 1000) break; }
+  return out;
+}
 async function listarDrive() {
   const out = []; let tok = "";
   do {
@@ -23,63 +40,78 @@ async function listarDrive() {
   } while (tok);
   return out.filter((f) => /^image\//.test(f.mimeType));
 }
-async function rest(method, path, body, prefer) {
-  const r = await fetch(`${URL_}/rest/v1/${path}`, { method, headers: H({ "Content-Type": "application/json", ...(prefer ? { Prefer: prefer } : {}) }), body: body === undefined ? undefined : JSON.stringify(body) });
-  const t = await r.text(); if (!r.ok) throw new Error(`${method} ${path.split("?")[0]} → ${r.status} ${t.slice(0, 200)}`);
-  return t ? JSON.parse(t) : null;
-}
 async function subir(ruta, buf) {
   const r = await fetch(`${URL_}/storage/v1/object/fotos/${ruta}`, { method: "POST", headers: H({ "Content-Type": "image/webp", "x-upsert": "true", "cache-control": "max-age=31536000" }), body: buf });
-  if (!r.ok) throw new Error(`Storage ${ruta} → ${r.status} ${(await r.text()).slice(0, 200)}`);
+  if (!r.ok) throw new Error(`Storage ${ruta} → ${r.status} ${(await r.text()).slice(0, 160)}`);
 }
 
-const archivos = await listarDrive();
-console.log(`Drive: ${archivos.length} imágenes`);
-if (archivos.length < 1) { console.error("La carpeta devolvió 0 imágenes: aborto sin tocar nada."); process.exit(1); }
-const ya = new Map();
-for (let off = 0; ; off += 1000) {
-  const f = await rest("GET", `fotos?select=drive_file_id,drive_modificado,ruta_storage&order=id&limit=1000&offset=${off}`);
-  f.forEach((x) => ya.set(x.drive_file_id, x)); if (f.length < 1000) break;
-}
-const pendientes = archivos.filter((f) => { const x = ya.get(f.id); return !x || !x.ruta_storage || new Date(x.drive_modificado).getTime() !== new Date(f.modificado || f.modifiedTime).getTime(); });
-console.log(`Pendientes: ${pendientes.length} (esta corrida: ${Math.min(MAX, pendientes.length)})`);
-
-const LIMITE = Date.now() + (+process.env.TIEMPO_MAX_MIN || 30) * 60000;
-let ok = 0, mal = 0;
-const lote = pendientes.slice(0, MAX);
-const dormir = (ms) => new Promise((r) => setTimeout(r, ms));
+// Pausa global cuando Google frena (403/429): todos los trabajadores esperan y se vuelve a intentar
+let pausaHasta = 0, pausaN = 0;
 async function bajar(f) {
   let motivo = "";
   for (let intento = 0; intento < 4; intento++) {
+    const espera = pausaHasta - Date.now(); if (espera > 0) await dormir(espera);
     for (const u of [`https://www.googleapis.com/drive/v3/files/${f.id}?alt=media&key=${GK}`, `https://drive.usercontent.google.com/download?id=${f.id}&export=download&confirm=t`]) {
       const r = await fetch(u);
       const tipo = r.headers.get("content-type") || "";
-      if (r.ok && tipo.startsWith("image/")) return Buffer.from(await r.arrayBuffer());
-      const t = r.ok ? "no devolvió imagen (" + tipo + ")" : (await r.text()).replace(/\s+/g, " ").slice(0, 160);
+      if (r.ok && tipo.startsWith("image/")) { pausaN = Math.max(0, pausaN - 1); return Buffer.from(await r.arrayBuffer()); }
+      const t = r.ok ? "no devolvió imagen (" + tipo + ")" : (await r.text()).replace(/\s+/g, " ").slice(0, 140);
       motivo = `${r.status} ${t}`;
+      if (r.status === 403 || r.status === 429) { pausaN = Math.min(pausaN + 1, 6); pausaHasta = Date.now() + 2000 * pausaN; }
     }
-    await dormir(1500 * (intento + 1));
   }
   throw new Error("descarga " + f.name + " → " + motivo);
 }
-async function uno(f) {
-  const buf = await bajar(f);
-  const src = buf;
-  const base = sharp(src, { failOn: "none" }).rotate();
-  const m = await base.clone().resize({ width: 900, withoutEnlargement: true }).webp({ quality: 80 }).toBuffer();
-  const t = await base.clone().resize({ width: 360, withoutEnlargement: true }).webp({ quality: 74 }).toBuffer();
-  const k = clave(f.name);
-  await subir(`m/${k}.webp`, m); await subir(`t/${k}.webp`, t);
-  await rest("POST", "fotos?on_conflict=drive_file_id", [{ drive_file_id: f.id, nombre_archivo: f.name, ruta_storage: `m/${k}.webp`, drive_modificado: f.modifiedTime }], "resolution=merge-duplicates,return=minimal");
-}
-let i = 0;
-await Promise.all(Array.from({ length: PAR }, async () => {
-  while (i < lote.length) { if (Date.now() > LIMITE) { console.log('Tiempo máximo alcanzado: corto ordenadamente; sigo en la próxima corrida.'); break; } if (mal >= 30 && ok === 0) { console.error('30 errores seguidos sin ninguna foto subida: corto para no gastar minutos.'); break; } const f = lote[i++]; try { await uno(f); ok++; } catch (e) { mal++; console.error("✗", f.name, e.message); } if ((ok + mal) % 50 === 0) console.log(`  ${ok + mal}/${lote.length}`); }
-}));
 
-// Quita de la base las fotos que ya no están en Drive (solo si la lista de Drive vino completa)
+// ---- 1) Qué hay en Drive, qué ya está en Supabase y qué productos están publicados
+const archivos = await listarDrive();
+console.log(`Drive: ${archivos.length} imágenes`);
+if (archivos.length < 1) { console.error("La carpeta devolvió 0 imágenes: aborto sin tocar nada."); process.exit(1); }
+const ya = new Map((await paginar("fotos?select=drive_file_id,drive_modificado,ruta_storage&order=id")).map((x) => [x.drive_file_id, x]));
+const publicadas = new Set((await paginar("catalogo_publicado?select=imagen&order=clave")).map((x) => norm(x.imagen)).filter(Boolean));
+console.log(`Productos publicados con foto indicada: ${publicadas.size}`);
+
+const cambiado = (f) => { const x = ya.get(f.id); return !x || !x.ruta_storage || new Date(x.drive_modificado).getTime() !== new Date(f.modifiedTime).getTime(); };
+const prio = (f) => publicadas.has(norm(f.name));
+let pend = archivos.filter(cambiado);
+const pendPrio = pend.filter(prio), pendResto = pend.filter((f) => !prio(f));
+const cola = SOLO_PUB ? pendPrio : [...pendPrio, ...pendResto];
+console.log(`Pendientes: ${pend.length} (de productos publicados: ${pendPrio.length}; otras: ${pendResto.length}${SOLO_PUB ? " — se omiten, usá SOLO_PUBLICADOS=0 para bajarlas" : ""})`);
+const lote = cola.slice(0, MAX);
+console.log(`Esta corrida: ${lote.length}`);
+
+// ---- 2) Procesar en paralelo
+let ok = 0, mal = 0, i = 0; const filas = [];
+async function volcar() {
+  if (!filas.length) return;
+  const x = filas.splice(0, filas.length);
+  await rest("POST", "fotos?on_conflict=drive_file_id", x, "resolution=merge-duplicates,return=minimal");
+}
+async function uno(f) {
+  const src = await bajar(f);
+  const m = await sharp(src, { failOn: "none", limitInputPixels: 80e6 }).rotate().resize({ width: 900, withoutEnlargement: true }).webp({ quality: 80, effort: 3 }).toBuffer();
+  const t = await sharp(m).resize({ width: 360, withoutEnlargement: true }).webp({ quality: 74, effort: 3 }).toBuffer();
+  const k = clave(f.name);
+  await Promise.all([subir(`m/${k}.webp`, m), subir(`t/${k}.webp`, t)]);
+  filas.push({ drive_file_id: f.id, nombre_archivo: f.name, ruta_storage: `m/${k}.webp`, drive_modificado: f.modifiedTime });
+  if (filas.length >= 25) await volcar();
+}
+const t0 = Date.now();
+await Promise.all(Array.from({ length: PAR }, async () => {
+  while (i < lote.length) {
+    if (Date.now() > LIMITE) { console.log("Tiempo máximo alcanzado: corto ordenadamente; sigo en la próxima corrida."); break; }
+    if (mal >= 30 && ok === 0) { console.error("30 errores seguidos sin ninguna foto subida: corto para no gastar minutos."); break; }
+    const f = lote[i++];
+    try { await uno(f); ok++; } catch (e) { mal++; console.error("✗", f.name, e.message); }
+    if ((ok + mal) % 50 === 0) console.log(`  ${ok + mal}/${lote.length} · ${Math.round((ok + mal) / ((Date.now() - t0) / 60000))} por minuto`);
+  }
+}));
+await volcar();
+
+// ---- 3) Quitar de la base las fotos que ya no están en Drive (la lista vino completa)
 const vivos = new Set(archivos.map((f) => f.id));
 const borrar = [...ya.keys()].filter((id) => !vivos.has(id));
 for (const id of borrar) await rest("DELETE", `fotos?drive_file_id=eq.${encodeURIComponent(id)}`);
-console.log(`Listo: ${ok} subidas, ${mal} con error, ${borrar.length} quitadas. Quedan ${Math.max(0, pendientes.length - lote.length)} por bajar.`);
-if (mal > lote.length / 2) process.exit(1);
+const faltan = Math.max(0, cola.length - ok);
+console.log(`Listo: ${ok} subidas, ${mal} con error, ${borrar.length} quitadas. Faltan ${faltan} de productos publicados${SOLO_PUB ? "" : " y otras"}.`);
+if (mal > Math.max(10, lote.length / 2)) process.exit(1);
