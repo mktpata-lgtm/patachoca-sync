@@ -7,7 +7,7 @@ import sharp from "sharp";
 const URL_ = (process.env.SUPABASE_URL || "").replace(/\/+$/, ""), KEY = process.env.SUPABASE_SERVICE_KEY;
 const GK = process.env.GOOGLE_API_KEY, FOLDER = process.env.DRIVE_FOLDER_ID;
 if (!URL_ || !KEY || !GK || !FOLDER) { console.error("Faltan SUPABASE_URL, SUPABASE_SERVICE_KEY, GOOGLE_API_KEY o DRIVE_FOLDER_ID"); process.exit(1); }
-const MAX = +(process.env.MAX_NUEVAS || 400), PAR = +(process.env.PARALELO || 4);
+const MAX = +(process.env.MAX_NUEVAS || 400), PAR = +(process.env.PARALELO || 2);
 const H = (x = {}) => ({ apikey: KEY, ...(KEY.startsWith("sb_secret_") ? {} : { Authorization: `Bearer ${KEY}` }), ...x });
 
 // Misma regla que la página: minúscula, sin espacios, sin extensión, solo [a-z0-9._-]
@@ -46,10 +46,24 @@ console.log(`Pendientes: ${pendientes.length} (esta corrida: ${Math.min(MAX, pen
 
 let ok = 0, mal = 0;
 const lote = pendientes.slice(0, MAX);
+const dormir = (ms) => new Promise((r) => setTimeout(r, ms));
+async function bajar(f) {
+  let motivo = "";
+  for (let intento = 0; intento < 4; intento++) {
+    for (const u of [`https://www.googleapis.com/drive/v3/files/${f.id}?alt=media&key=${GK}`, `https://drive.usercontent.google.com/download?id=${f.id}&export=download&confirm=t`]) {
+      const r = await fetch(u);
+      const tipo = r.headers.get("content-type") || "";
+      if (r.ok && tipo.startsWith("image/")) return Buffer.from(await r.arrayBuffer());
+      const t = r.ok ? "no devolvió imagen (" + tipo + ")" : (await r.text()).replace(/\s+/g, " ").slice(0, 160);
+      motivo = `${r.status} ${t}`;
+    }
+    await dormir(1500 * (intento + 1));
+  }
+  throw new Error("descarga " + f.name + " → " + motivo);
+}
 async function uno(f) {
-  const r = await fetch(`https://www.googleapis.com/drive/v3/files/${f.id}?alt=media&key=${GK}`);
-  if (!r.ok) throw new Error(`descarga ${f.name} → ${r.status}`);
-  const src = Buffer.from(await r.arrayBuffer());
+  const buf = await bajar(f);
+  const src = buf;
   const base = sharp(src, { failOn: "none" }).rotate();
   const m = await base.clone().resize({ width: 900, withoutEnlargement: true }).webp({ quality: 80 }).toBuffer();
   const t = await base.clone().resize({ width: 360, withoutEnlargement: true }).webp({ quality: 74 }).toBuffer();
@@ -59,7 +73,7 @@ async function uno(f) {
 }
 let i = 0;
 await Promise.all(Array.from({ length: PAR }, async () => {
-  while (i < lote.length) { const f = lote[i++]; try { await uno(f); ok++; } catch (e) { mal++; console.error("✗", f.name, e.message); } if ((ok + mal) % 50 === 0) console.log(`  ${ok + mal}/${lote.length}`); }
+  while (i < lote.length) { if (mal >= 30 && ok === 0) { console.error('30 errores seguidos sin ninguna foto subida: corto para no gastar minutos.'); break; } const f = lote[i++]; try { await uno(f); ok++; } catch (e) { mal++; console.error("✗", f.name, e.message); } if ((ok + mal) % 50 === 0) console.log(`  ${ok + mal}/${lote.length}`); }
 }));
 
 // Quita de la base las fotos que ya no están en Drive (solo si la lista de Drive vino completa)
