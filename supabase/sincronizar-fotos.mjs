@@ -44,6 +44,7 @@ for (let off = 0; ; off += 1000) {
 const pendientes = archivos.filter((f) => { const x = ya.get(f.id); return !x || !x.ruta_storage || new Date(x.drive_modificado).getTime() !== new Date(f.modificado || f.modifiedTime).getTime(); });
 console.log(`Pendientes: ${pendientes.length} (esta corrida: ${Math.min(MAX, pendientes.length)})`);
 
+const LIMITE = Date.now() + (+process.env.TIEMPO_MAX_MIN || 30) * 60000;
 let ok = 0, mal = 0;
 const lote = pendientes.slice(0, MAX);
 const dormir = (ms) => new Promise((r) => setTimeout(r, ms));
@@ -73,7 +74,7 @@ async function uno(f) {
 }
 let i = 0;
 await Promise.all(Array.from({ length: PAR }, async () => {
-  while (i < lote.length) { if (mal >= 30 && ok === 0) { console.error('30 errores seguidos sin ninguna foto subida: corto para no gastar minutos.'); break; } const f = lote[i++]; try { await uno(f); ok++; } catch (e) { mal++; console.error("✗", f.name, e.message); } if ((ok + mal) % 50 === 0) console.log(`  ${ok + mal}/${lote.length}`); }
+  while (i < lote.length) { if (Date.now() > LIMITE) { console.log('Tiempo máximo alcanzado: corto ordenadamente; sigo en la próxima corrida.'); break; } if (mal >= 30 && ok === 0) { console.error('30 errores seguidos sin ninguna foto subida: corto para no gastar minutos.'); break; } const f = lote[i++]; try { await uno(f); ok++; } catch (e) { mal++; console.error("✗", f.name, e.message); } if ((ok + mal) % 50 === 0) console.log(`  ${ok + mal}/${lote.length}`); }
 }));
 
 // Quita de la base las fotos que ya no están en Drive (solo si la lista de Drive vino completa)
