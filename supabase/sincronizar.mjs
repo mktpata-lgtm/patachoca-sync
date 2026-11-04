@@ -41,6 +41,7 @@ try {
   }
 
   // 2) Leer el origen
+  const t0 = Date.now();
   let filas;
   if (val("--archivo")) filas = JSON.parse(fs.readFileSync(val("--archivo"), "utf8"));
   else {
@@ -55,6 +56,8 @@ try {
     catch (e) { console.log(`Primer intento falló (${e.message}); reintentando…`); filas = await pedir(); }
   }
   if (!Array.isArray(filas) || filas.length < MIN) throw new Error(`El origen trajo ${Array.isArray(filas) ? filas.length : "datos inválidos"} filas (mínimo ${MIN}): no se toca nada`);
+
+  const tGestor = Math.round((Date.now() - t0) / 1000);
 
   // 3) Transformar y subir (upsert por lotes)
   const reglas = JSON.parse(fs.readFileSync(new URL("../config/reglas.json", import.meta.url), "utf8"));
@@ -81,6 +84,7 @@ try {
   const stk = T.stock.filter((r) => setC.has(claveDe.get(r.variante_id))).map((r) => ({ ...r, visto: inicio }));
   console.log(`Cambiaron ${cambiados.length} de ${T.productos.length} productos (${vars.length} variantes, ${stk.length} stocks). Ausentes del origen: ${ausentes.length}.`);
 
+  const tG0 = Date.now();
   const subir = async (t, filas, conf) => { for (let i = 0; i < filas.length; i += 1000) await api("POST", `${t}?on_conflict=${conf}`, filas.slice(i, i + 1000), "resolution=merge-duplicates,return=minimal"); };
   await subir("sucursales", T.sucursales, "id");
   await subir("productos", cambiados, "clave");
@@ -93,8 +97,22 @@ try {
   for (let i = 0; i < ausentes.length; i += 500) enCero += await rpc("sync_ausentes", { p_claves: ausentes.slice(i, i + 500) });
   // Recién ahora se guarda la huella: si algo falló antes, la próxima corrida reintenta esos productos
   for (let i = 0; i < cambiados.length; i += 500) await rpc("sync_marcar", { p: cambiados.slice(i, i + 500).map((p) => ({ clave: p.clave, hash: huella.get(p.clave) })) });
+  let antes = null;
+  try { antes = (await api("GET", "catalogo_cache?select=productos&id=eq.1"))[0]?.productos ?? null; } catch {}
   const publicados = await rpc("refrescar_catalogo");
-  await fin("ok", { productos: cambiados.length, variantes: vars.length, stock: stk.length, detalle: `${cambiados.length} productos cambiados de ${T.productos.length} · ${publicados} publicados · ${enCero} stocks puestos en 0` });
+  const nombre = (p) => `${p.nombre} ${p.color || ""}`.trim() + (p.cod_fabrica ? ` (${p.cod_fabrica})` : "");
+  const nuevos = cambiados.filter((p) => !previas.has(p.clave));
+  const porMarca = {}; for (const p of cambiados) porMarca[p.marca || "—"] = (porMarca[p.marca || "—"] || 0) + 1;
+  const reporte = {
+    v: 1,
+    leidos: { productos: T.productos.length, variantes: T.variantes.length, stock: T.stock.length, sucursales: T.sucursales.length },
+    nuevos: nuevos.length, modificados: cambiados.length - nuevos.length, sinCambios: T.productos.length - cambiados.length,
+    ausentes: ausentes.length, enCero, publicados, publicadosAntes: antes,
+    seg: { gestor: tGestor, guardado: Math.round((Date.now() - tG0) / 1000), total: Math.round((Date.now() - new Date(inicio).getTime()) / 1000) },
+    nuevosEj: nuevos.slice(0, 8).map(nombre),
+    marcas: Object.entries(porMarca).sort((a, b) => b[1] - a[1]).slice(0, 6),
+  };
+  await fin("ok", { productos: cambiados.length, variantes: vars.length, stock: stk.length, detalle: JSON.stringify(reporte) });
   console.log(`Listo: ${cambiados.length} productos actualizados, ${publicados} publicados, ${enCero} stocks puestos en 0.`);
 } catch (e) {
   console.error("ERROR:", e.message);
