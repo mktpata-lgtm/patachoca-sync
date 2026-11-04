@@ -39,7 +39,7 @@ async function listarDrive() {
   const out = []; let tok = "";
   do {
     const q = encodeURIComponent(`'${FOLDER}' in parents and trashed=false`);
-    const r = await fetch(`https://www.googleapis.com/drive/v3/files?q=${q}&pageSize=1000&fields=nextPageToken,files(id,name,mimeType,modifiedTime)&key=${GK}${tok ? "&pageToken=" + tok : ""}`);
+    const r = await fetch(`https://www.googleapis.com/drive/v3/files?q=${q}&pageSize=1000&fields=nextPageToken,files(id,name,mimeType,modifiedTime,size,imageMediaMetadata(width,height))&key=${GK}${tok ? "&pageToken=" + tok : ""}`);
     if (!r.ok) throw new Error(`Drive lista → ${r.status} ${(await r.text()).slice(0, 200)}`);
     const j = await r.json(); out.push(...j.files); tok = j.nextPageToken || "";
   } while (tok);
@@ -91,7 +91,17 @@ const archivos = await listarDrive();
 console.log(`Drive: ${archivos.length} imágenes`);
 enDrive = archivos.length;
 if (archivos.length < 1) { console.error("La carpeta devolvió 0 imágenes: aborto sin tocar nada."); await cerrar("error", { detalle: "La carpeta de Drive devolvió 0 imágenes" }); process.exit(1); }
-const ya = new Map((await paginar("fotos?select=drive_file_id,drive_modificado,ruta_storage&order=id")).map((x) => [x.drive_file_id, x]));
+// Medidas de la foto original (alto, ancho, peso, formato): Drive las informa sin descargar nada. Requiere 13_fotos_medidas.sql.
+let conMedidas = true, yaLista;
+try { yaLista = await paginar("fotos?select=drive_file_id,drive_modificado,ruta_storage,ancho,alto,bytes,formato&order=id"); }
+catch (e) { conMedidas = false; console.log("Aviso: falta ejecutar 13_fotos_medidas.sql; no se guardan las medidas de las fotos."); yaLista = await paginar("fotos?select=drive_file_id,drive_modificado,ruta_storage&order=id"); }
+const ya = new Map(yaLista.map((x) => [x.drive_file_id, x]));
+const meta = (f) => ({ ancho: f.imageMediaMetadata?.width ?? null, alto: f.imageMediaMetadata?.height ?? null, bytes: f.size ? +f.size : null, formato: (f.mimeType || "").replace("image/", "") || null });
+if (conMedidas) {
+  const dif = archivos.filter((f) => { const x = ya.get(f.id); if (!x || !x.ruta_storage) return false; const m = meta(f); return m.ancho != null && (x.ancho !== m.ancho || x.alto !== m.alto || +x.bytes !== m.bytes || x.formato !== m.formato); });
+  for (let k = 0; k < dif.length; k += 500) await rest("POST", "fotos?on_conflict=drive_file_id", dif.slice(k, k + 500).map((f) => ({ drive_file_id: f.id, nombre_archivo: f.name, ...meta(f) })), "resolution=merge-duplicates,return=minimal");
+  console.log(`Medidas guardadas: ${dif.length} fotos`);
+}
 const publicadas = new Set((await paginar("catalogo_publicado?select=imagen,cod_fabrica,color&order=clave")).map((x) => (x.imagen ? norm(x.imagen) : derivado(x.cod_fabrica, x.color))).filter(Boolean));
 console.log(`Productos publicados con foto indicada: ${publicadas.size}`);
 
@@ -117,7 +127,7 @@ async function uno(f) {
   const t = await sharp(m).resize({ width: 360, withoutEnlargement: true }).webp({ quality: 74, effort: 3 }).toBuffer();
   const k = clave(f.name);
   await Promise.all([subir(`m/${k}.webp`, m), subir(`t/${k}.webp`, t)]);
-  filas.push({ drive_file_id: f.id, nombre_archivo: f.name, ruta_storage: `m/${k}.webp`, drive_modificado: f.modifiedTime });
+  filas.push({ drive_file_id: f.id, nombre_archivo: f.name, ruta_storage: `m/${k}.webp`, drive_modificado: f.modifiedTime, ...(conMedidas ? meta(f) : {}) });
   if (filas.length >= 25) await volcar();
 }
 const t0 = Date.now(), ventana = []; let frenado = false;
