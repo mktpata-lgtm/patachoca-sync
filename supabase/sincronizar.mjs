@@ -18,9 +18,13 @@ const URL_ = (process.env.SUPABASE_URL || "").replace(/\/+$/, ""), KEY = process
 if (!URL_ || !KEY) { console.error("Faltan SUPABASE_URL y SUPABASE_SERVICE_KEY"); process.exit(1); }
 const MIN = +(process.env.MIN_FILAS || 1000);
 
+// Muestra la causa real de "fetch failed" (DNS, conexión rechazada, tiempo agotado, certificado…)
+const causa = (e) => { const c = e?.cause; return c ? ` [${c.code || c.name || ""} ${c.message || ""}${c.hostname ? " · " + c.hostname : ""}]`.replace(/\s+\]/, "]") : ""; };
 const H = (extra = {}) => ({ apikey: KEY, ...(KEY.startsWith("sb_secret_") ? {} : { Authorization: `Bearer ${KEY}` }), "Content-Type": "application/json", ...extra });
 async function api(method, path, body, prefer) {
-  const r = await fetch(`${URL_}/rest/v1/${path}`, { method, headers: H(prefer ? { Prefer: prefer } : {}), body: body === undefined ? undefined : JSON.stringify(body) });
+  let r;
+  try { r = await fetch(`${URL_}/rest/v1/${path}`, { method, headers: H(prefer ? { Prefer: prefer } : {}), body: body === undefined ? undefined : JSON.stringify(body) }); }
+  catch (e) { throw new Error(`No se pudo conectar con SUPABASE (${method} ${path.split("?")[0]}): ${e.message}${causa(e)}`); }
   const txt = await r.text();
   if (!r.ok) throw new Error(`${method} ${path.split("?")[0]} → ${r.status} ${txt.slice(0, 200)}`);
   return txt ? JSON.parse(txt) : null;
@@ -48,7 +52,9 @@ try {
     if (!process.env.GESTOR_URL) throw new Error("Falta GESTOR_URL (o usá --archivo)");
     // El gestor arma el JSON al momento (3 a 5 min, a veces más): se espera hasta 8 min y se reintenta una vez.
     const pedir = async () => {
-      const r = await fetch(process.env.GESTOR_URL, { headers: process.env.GESTOR_TOKEN ? { Authorization: `Bearer ${process.env.GESTOR_TOKEN}` } : {}, signal: AbortSignal.timeout(480000) });
+      let r;
+      try { r = await fetch(process.env.GESTOR_URL, { headers: process.env.GESTOR_TOKEN ? { Authorization: `Bearer ${process.env.GESTOR_TOKEN}` } : {}, signal: AbortSignal.timeout(480000) }); }
+      catch (e) { throw new Error(`No se pudo conectar con el SISTEMA DE GESTIÓN (${new URL(process.env.GESTOR_URL).host}): ${e.message}${causa(e)}`); }
       if (!r.ok) throw new Error(`El origen respondió ${r.status}`);
       return r.json();
     };
@@ -62,6 +68,26 @@ try {
   // 3) Transformar y subir (upsert por lotes)
   const reglas = JSON.parse(fs.readFileSync(new URL("../config/reglas.json", import.meta.url), "utf8"));
   const T = transformar(filas, reglas);
+  // Filtros de optimización del panel (Admin → Fuentes de datos → Qué se sincroniza). Por defecto no se filtra nada.
+  let filtros = {};
+  try { filtros = (await api("GET", "config?clave=eq.sync_filtros&select=valor"))[0]?.valor || {}; } catch {}
+  const antesFiltro = { productos: T.productos.length, variantes: T.variantes.length, stock: T.stock.length };
+  if (filtros.sinExcluidos) {
+    const rg = (await api("GET", "reglas_publicacion?select=grupos_excluidos,subgrupos_excluidos&limit=1"))[0];
+    const U = (a) => new Set((a || []).map((x) => String(x).trim().toUpperCase()));
+    const gEx = U(rg?.grupos_excluidos), sEx = U(rg?.subgrupos_excluidos);
+    if (gEx.size || sEx.size) {
+      T.productos = T.productos.filter((p) => !gEx.has(String(p.grupo || "").trim().toUpperCase()) && !sEx.has(String(p.subgrupo || "").trim().toUpperCase()));
+      const ok = new Set(T.productos.map((p) => p.clave));
+      T.variantes = T.variantes.filter((v) => ok.has(v.producto_clave));
+      const okV = new Set(T.variantes.map((v) => v.id));
+      T.stock = T.stock.filter((r) => okV.has(r.variante_id));
+    }
+  }
+  if (filtros.soloSucActivas) {
+    const act = new Set((await api("GET", "sucursales?select=id&activa=eq.true")).map((x) => x.id));
+    T.stock = T.stock.filter((r) => act.has(r.sucursal_id));
+  }
   console.log(Object.entries(T).map(([k, v]) => `${k}: ${v.length}`).join(" · "));
   if (flag("--dry")) process.exit(0);
   // Huella por producto = producto + sus variantes + su stock. Solo se envía lo que cambió.
@@ -105,9 +131,10 @@ try {
   const porMarca = {}; for (const p of cambiados) porMarca[p.marca || "—"] = (porMarca[p.marca || "—"] || 0) + 1;
   const reporte = {
     v: 1,
-    leidos: { productos: T.productos.length, variantes: T.variantes.length, stock: T.stock.length, sucursales: T.sucursales.length },
+    leidos: { productos: antesFiltro.productos, variantes: antesFiltro.variantes, stock: antesFiltro.stock, sucursales: T.sucursales.length },
     nuevos: nuevos.length, modificados: cambiados.length - nuevos.length, sinCambios: T.productos.length - cambiados.length,
     ausentes: ausentes.length, enCero, publicados, publicadosAntes: antes,
+    filtros: { sinExcluidos: !!filtros.sinExcluidos, soloSucActivas: !!filtros.soloSucActivas, omitidosProductos: antesFiltro.productos - T.productos.length, omitidosStock: antesFiltro.stock - T.stock.length },
     seg: { gestor: tGestor, guardado: Math.round((Date.now() - tG0) / 1000), total: Math.round((Date.now() - new Date(inicio).getTime()) / 1000) },
     nuevosEj: nuevos.slice(0, 8).map(nombre),
     marcas: Object.entries(porMarca).sort((a, b) => b[1] - a[1]).slice(0, 6),
@@ -116,6 +143,6 @@ try {
   console.log(`Listo: ${cambiados.length} productos actualizados, ${publicados} publicados, ${enCero} stocks puestos en 0.`);
 } catch (e) {
   console.error("ERROR:", e.message);
-  try { await fin("error", { detalle: String(e.message).slice(0, 500) }); } catch {}
+  try { await fin("error", { detalle: String(e.message).slice(0, 700) }); } catch {}
   process.exit(1);
 }
