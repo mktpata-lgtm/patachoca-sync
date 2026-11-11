@@ -110,6 +110,39 @@ try {
   const stk = T.stock.filter((r) => setC.has(claveDe.get(r.variante_id))).map((r) => ({ ...r, visto: inicio }));
   console.log(`Cambiaron ${cambiados.length} de ${T.productos.length} productos (${vars.length} variantes, ${stk.length} stocks). Ausentes del origen: ${ausentes.length}.`);
 
+  // Detalle "antes → ahora" por producto (se ve en Admin → Fuentes de datos). Si algo falla aquí, la sincronización sigue igual.
+  let detCambios = [];
+  try {
+    const LIM = 300, LIMN = 50;
+    const mod = cambiados.filter((p) => previas.has(p.clave)).slice(0, LIM);
+    const nue = cambiados.filter((p) => !previas.has(p.clave)).slice(0, LIMN);
+    const q = (c) => encodeURIComponent('"' + String(c).replace(/"/g, '\\"') + '"');
+    const vA = [], sA = [];
+    for (let i = 0; i < mod.length; i += 25)
+      vA.push(...(await api("GET", `variantes?select=id,producto_clave,talla,precio,precio_promo&limit=1000&producto_clave=in.(${mod.slice(i, i + 25).map((p) => q(p.clave)).join(",")})`)));
+    for (let i = 0; i < vA.length; i += 100)
+      sA.push(...(await api("GET", `stock?select=variante_id,sucursal_id,cantidad&limit=1000&variante_id=in.(${vA.slice(i, i + 100).map((v) => v.id).join(",")})`)));
+    const resumen = (vs, ss) => {
+      const tal = new Map(vs.map((v) => [String(v.id), v.talla]));
+      const pr = vs.map((v) => +v.precio).filter((x) => x > 0), pp = vs.map((v) => +v.precio_promo).filter((x) => x > 0);
+      const o = { p: pr.length ? Math.min(...pr) : 0, pp: pp.length ? Math.min(...pp) : 0, s: 0, suc: {}, t: {} };
+      for (const r of ss) { const c = +r.cantidad || 0; o.s += c; o.suc[r.sucursal_id] = (o.suc[r.sucursal_id] || 0) + c; const t = tal.get(String(r.variante_id)); if (t != null) o.t[t] = (o.t[t] || 0) + c; }
+      return o;
+    };
+    const dif = (a, b) => { const o = {}; for (const k of new Set([...Object.keys(a), ...Object.keys(b)])) if ((a[k] || 0) !== (b[k] || 0)) o[k] = [a[k] || 0, b[k] || 0]; return o; };
+    const vPorA = new Map(), sPorV = new Map();
+    for (const v of vA) (vPorA.get(v.producto_clave) || vPorA.set(v.producto_clave, []).get(v.producto_clave)).push(v);
+    for (const r of sA) (sPorV.get(String(r.variante_id)) || sPorV.set(String(r.variante_id), []).get(String(r.variante_id))).push(r);
+    const nom = (p) => `${p.nombre} ${p.color || ""}`.trim() + (p.cod_fabrica ? ` (${p.cod_fabrica})` : "");
+    for (const p of [...mod, ...nue]) {
+      const nuevo = !previas.has(p.clave);
+      const vN = vPor.get(p.clave) || [], sN = sPor.get(p.clave) || [];
+      const vO = nuevo ? [] : vPorA.get(p.clave) || [], sO = nuevo ? [] : vO.flatMap((v) => sPorV.get(String(v.id)) || []);
+      const a = resumen(vO, sO), b = resumen(vN, sN);
+      detCambios.push({ clave: p.clave, nombre: nom(p), tipo: nuevo ? "nuevo" : "mod", d: { p: [a.p, b.p], pp: [a.pp, b.pp], s: [a.s, b.s], suc: dif(a.suc, b.suc), t: dif(a.t, b.t) } });
+    }
+  } catch (e) { console.log(`Detalle antes/ahora omitido: ${e.message}`); detCambios = []; }
+
   const tG0 = Date.now();
   const subir = async (t, filas, conf) => { for (let i = 0; i < filas.length; i += 1000) await api("POST", `${t}?on_conflict=${conf}`, filas.slice(i, i + 1000), "resolution=merge-duplicates,return=minimal"); };
   await subir("sucursales", T.sucursales, "id");
@@ -137,8 +170,13 @@ try {
     filtros: { sinExcluidos: !!filtros.sinExcluidos, soloSucActivas: !!filtros.soloSucActivas, omitidosProductos: antesFiltro.productos - T.productos.length, omitidosStock: antesFiltro.stock - T.stock.length },
     seg: { gestor: tGestor, guardado: Math.round((Date.now() - tG0) / 1000), total: Math.round((Date.now() - new Date(inicio).getTime()) / 1000) },
     nuevosEj: nuevos.slice(0, 8).map(nombre),
+    cambiosGuardados: detCambios.length,
     marcas: Object.entries(porMarca).sort((a, b) => b[1] - a[1]).slice(0, 6),
   };
+  try {
+    for (let i = 0; i < detCambios.length; i += 200) await api("POST", "sync_cambios", detCambios.slice(i, i + 200).map((x) => ({ corrida_id: corrida, ...x })), "return=minimal");
+    await api("DELETE", `sync_cambios?creado=lt.${encodeURIComponent(new Date(Date.now() - 14 * 864e5).toISOString())}`);
+  } catch (e) { console.log(`No se pudo guardar el detalle por producto: ${e.message}`); }
   await fin("ok", { productos: cambiados.length, variantes: vars.length, stock: stk.length, detalle: JSON.stringify(reporte) });
   console.log(`Listo: ${cambiados.length} productos actualizados, ${publicados} publicados, ${enCero} stocks puestos en 0.`);
 } catch (e) {
