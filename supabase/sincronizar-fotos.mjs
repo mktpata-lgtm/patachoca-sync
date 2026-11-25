@@ -25,10 +25,20 @@ const norm = quitarExt;
 // Productos sin nombre de imagen en el sistema: el nombre habitual es CODIGO_CCOLOR (sin espacios, "|" ni "/")
 const derivado = (cod, color) => quitarExt(String(cod || "").replace(/[|\/\s]/g, "") + "_C" + String(color || "").replace(/\s/g, ""));
 
+const TRANSITORIO = new Set([408, 425, 429, 500, 502, 503, 504, 520, 521, 522, 523, 524]);
+const ESP = [4000, 10000, 25000];
 async function rest(method, path, body, prefer) {
-  const r = await fetch(`${URL_}/rest/v1/${path}`, { method, headers: H({ "Content-Type": "application/json", ...(prefer ? { Prefer: prefer } : {}) }), body: body === undefined ? undefined : JSON.stringify(body) });
-  const t = await r.text(); if (!r.ok) throw new Error(`${method} ${path.split("?")[0]} → ${r.status} ${t.slice(0, 200)}`);
-  return t ? JSON.parse(t) : null;
+  const cuerpo = body === undefined ? undefined : JSON.stringify(body);
+  for (let n = 0; ; n++) {
+    let r, t = "", falla = "";
+    try { r = await fetch(`${URL_}/rest/v1/${path}`, { method, headers: H({ "Content-Type": "application/json", ...(prefer ? { Prefer: prefer } : {}) }), body: cuerpo, signal: AbortSignal.timeout(120000) }); t = await r.text(); }
+    catch (e) { falla = `${method} ${path.split("?")[0]} → sin conexión: ${e.message}`; }
+    if (!falla && r.ok) return t ? JSON.parse(t) : null;
+    if (!falla) falla = `${method} ${path.split("?")[0]} → ${r.status} ${/^\s*<(!doctype|html)/i.test(t) ? "(respuesta HTML de Cloudflare: Supabase tardó demasiado)" : t.slice(0, 200)}`;
+    if ((r && !TRANSITORIO.has(r.status)) || n >= ESP.length) throw new Error(falla);
+    console.log(`Aviso: ${falla}. Reintento ${n + 1}/${ESP.length}…`);
+    await new Promise((x) => setTimeout(x, ESP[n]));
+  }
 }
 async function paginar(path) {
   const out = [];
