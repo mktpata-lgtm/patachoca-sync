@@ -21,13 +21,24 @@ const MIN = +(process.env.MIN_FILAS || 1000);
 // Muestra la causa real de "fetch failed" (DNS, conexión rechazada, tiempo agotado, certificado…)
 const causa = (e) => { const c = e?.cause; return c ? ` [${c.code || c.name || ""} ${c.message || ""}${c.hostname ? " · " + c.hostname : ""}]`.replace(/\s+\]/, "]") : ""; };
 const H = (extra = {}) => ({ apikey: KEY, ...(KEY.startsWith("sb_secret_") ? {} : { Authorization: `Bearer ${KEY}` }), "Content-Type": "application/json", ...extra });
+// Errores pasajeros (Supabase/Cloudflare ocupado: 429, 5xx, 520-524, cortes de red): se reintenta con espera creciente
+const TRANSITORIO = new Set([408, 425, 429, 500, 502, 503, 504, 520, 521, 522, 523, 524]);
+const dormir = (ms) => new Promise((r) => setTimeout(r, ms));
+const ESPERAS = [4000, 10000, 25000, 45000];
+const limpio = (t) => /^\s*<(!doctype|html)/i.test(t) ? "(respuesta HTML de Cloudflare: el servidor de Supabase tardó demasiado o no respondió)" : t.slice(0, 200);
 async function api(method, path, body, prefer) {
-  let r;
-  try { r = await fetch(`${URL_}/rest/v1/${path}`, { method, headers: H(prefer ? { Prefer: prefer } : {}), body: body === undefined ? undefined : JSON.stringify(body) }); }
-  catch (e) { throw new Error(`No se pudo conectar con SUPABASE (${method} ${path.split("?")[0]}): ${e.message}${causa(e)}`); }
-  const txt = await r.text();
-  if (!r.ok) throw new Error(`${method} ${path.split("?")[0]} → ${r.status} ${txt.slice(0, 200)}`);
-  return txt ? JSON.parse(txt) : null;
+  const cuerpo = body === undefined ? undefined : JSON.stringify(body);
+  for (let intento = 0; ; intento++) {
+    let r, txt, falla = "";
+    try { r = await fetch(`${URL_}/rest/v1/${path}`, { method, headers: H(prefer ? { Prefer: prefer } : {}), body: cuerpo, signal: AbortSignal.timeout(120000) }); txt = await r.text(); }
+    catch (e) { falla = `No se pudo conectar con SUPABASE (${method} ${path.split("?")[0]}): ${e.message}${causa(e)}`; }
+    if (!falla && r.ok) return txt ? JSON.parse(txt) : null;
+    if (!falla) falla = `${method} ${path.split("?")[0]} → ${r.status} ${limpio(txt)}`;
+    const reintentable = !r || TRANSITORIO.has(r.status);
+    if (!reintentable || intento >= ESPERAS.length) throw new Error(falla + (intento ? ` (tras ${intento + 1} intentos)` : ""));
+    console.log(`Aviso: ${falla}. Reintento ${intento + 1}/${ESPERAS.length} en ${ESPERAS[intento] / 1000} s…`);
+    await dormir(ESPERAS[intento]);
+  }
 }
 const rpc = (fn, body = {}) => api("POST", `rpc/${fn}`, body);
 
@@ -144,7 +155,7 @@ try {
   } catch (e) { console.log(`Detalle antes/ahora omitido: ${e.message}`); detCambios = []; }
 
   const tG0 = Date.now();
-  const subir = async (t, filas, conf) => { for (let i = 0; i < filas.length; i += 1000) await api("POST", `${t}?on_conflict=${conf}`, filas.slice(i, i + 1000), "resolution=merge-duplicates,return=minimal"); };
+  const subir = async (t, filas, conf) => { for (let i = 0; i < filas.length; i += 400) await api("POST", `${t}?on_conflict=${conf}`, filas.slice(i, i + 400), "resolution=merge-duplicates,return=minimal"); };
   await subir("sucursales", T.sucursales, "id");
   await subir("productos", cambiados, "clave");
   await subir("variantes", vars, "id");
