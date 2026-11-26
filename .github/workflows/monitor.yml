@@ -1,0 +1,35 @@
+name: Vigilar la tienda
+# Revisa cada 30 minutos que la tienda abra y que el stock se esté sincronizando.
+# Si algo falla, esta ejecución queda en rojo y GitHub te avisa por correo.
+on:
+  schedule: [{ cron: "*/30 * * * *" }]
+  workflow_dispatch: {}
+concurrency: { group: monitor, cancel-in-progress: true }
+jobs:
+  vigilar:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    env:
+      # Cuando el dominio ya esté en producción, cambiar por https://www.patachoca.com.py
+      SITE_URL: https://patachoca-web.vercel.app
+      MAX_MIN_SIN_SINCRONIZAR: "180"
+      SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+      # Clave pública (la misma que ya usa la tienda en el navegador)
+      SUPABASE_PUBLICA: sb_publishable_hG2I9m_ICJw3NcdjSzTXsQ_FjtcPZgj
+    steps:
+      - name: La tienda abre
+        run: |
+          code=$(curl -s -o home.html -w "%{http_code}" -m 30 --retry 2 --retry-delay 5 "$SITE_URL/")
+          echo "Respuesta de la tienda: $code"
+          if [ "$code" != "200" ]; then echo "::error::La tienda respondió $code (debería ser 200)"; exit 1; fi
+          if ! grep -q "Patachoca" home.html; then echo "::error::La tienda abre pero no muestra el contenido esperado"; exit 1; fi
+      - name: El stock se sincroniza
+        run: |
+          r=$(curl -s -m 30 --retry 2 --retry-delay 5 -X POST "$SUPABASE_URL/rest/v1/rpc/catalogo_version" \
+            -H "apikey: $SUPABASE_PUBLICA" -H "Content-Type: application/json" -d '{}')
+          echo "Respuesta: $r"
+          g=$(echo "$r" | sed -n 's/.*"g"[: ]*"\([^"]*\)".*/\1/p')
+          if [ -z "$g" ]; then echo "::error::Supabase no respondió o el catálogo no tiene fecha"; exit 1; fi
+          edad=$(( ( $(date +%s) - $(date -d "$g" +%s) ) / 60 ))
+          echo "El catálogo tiene $edad minutos"
+          if [ "$edad" -gt "$MAX_MIN_SIN_SINCRONIZAR" ]; then echo "::error::El stock no se sincroniza hace $edad minutos (límite $MAX_MIN_SIN_SINCRONIZAR)"; exit 1; fi
